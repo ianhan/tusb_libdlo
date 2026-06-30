@@ -31,6 +31,8 @@
 #define TELNET_TERMINAL_TYPE "xterm-256color"
 #define TELNET_WINDOW_COLS 80u
 #define TELNET_WINDOW_ROWS 30u
+#define TELNET_RX_SIZE 16384u
+#define TELNET_WORK_CHUNK 512u
 
 typedef enum telnet_state_e {
     TELNET_IDLE,
@@ -43,6 +45,9 @@ static typewriter_net_writer_t output_writer;
 static char output_ring[NET_OUTPUT_SIZE];
 static volatile uint16_t output_head;
 static volatile uint16_t output_tail;
+static char telnet_rx_ring[TELNET_RX_SIZE];
+static volatile uint16_t telnet_rx_head;
+static volatile uint16_t telnet_rx_tail;
 
 static bool wifi_ready;
 static bool wifi_scan_running;
@@ -56,6 +61,8 @@ static struct tcp_pcb *telnet_pcb;
 static uint16_t telnet_port = TELNET_DEFAULT_PORT;
 static uint32_t telnet_generation;
 static char telnet_host[96];
+static volatile bool telnet_start_pending;
+static volatile bool telnet_reset_pending;
 
 static const telnet_telopt_t telnet_options[] = {
     { TELNET_TELOPT_TTYPE, TELNET_WILL, TELNET_DONT },
@@ -67,6 +74,10 @@ static const telnet_telopt_t telnet_options[] = {
 
 static uint16_t ring_next(uint16_t value) {
     return (uint16_t)((value + 1u) % NET_OUTPUT_SIZE);
+}
+
+static uint16_t telnet_rx_next(uint16_t value) {
+    return (uint16_t)((value + 1u) % TELNET_RX_SIZE);
 }
 
 static void output_enqueue(const char *data, size_t len) {
@@ -121,6 +132,59 @@ static void output_drain(void) {
         }
         output_writer(buffer, len);
     }
+}
+
+static void telnet_rx_clear(void) {
+    uint32_t flags = save_and_disable_interrupts();
+    telnet_rx_head = 0;
+    telnet_rx_tail = 0;
+    restore_interrupts(flags);
+}
+
+static size_t telnet_rx_free_space(void) {
+    size_t free_space;
+    uint32_t flags = save_and_disable_interrupts();
+    if (telnet_rx_head >= telnet_rx_tail) {
+        free_space = (TELNET_RX_SIZE - (telnet_rx_head - telnet_rx_tail)) - 1u;
+    } else {
+        free_space = (telnet_rx_tail - telnet_rx_head) - 1u;
+    }
+    restore_interrupts(flags);
+    return free_space;
+}
+
+static size_t telnet_rx_enqueue(const char *data, size_t len) {
+    if (!data || !len) {
+        return 0;
+    }
+
+    size_t written = 0;
+    uint32_t flags = save_and_disable_interrupts();
+    while (written < len) {
+        uint16_t next = telnet_rx_next(telnet_rx_head);
+        if (next == telnet_rx_tail) {
+            break;
+        }
+        telnet_rx_ring[telnet_rx_head] = data[written++];
+        telnet_rx_head = next;
+    }
+    restore_interrupts(flags);
+    return written;
+}
+
+static size_t telnet_rx_dequeue(char *data, size_t max_len) {
+    if (!data || !max_len) {
+        return 0;
+    }
+
+    size_t read = 0;
+    uint32_t flags = save_and_disable_interrupts();
+    while (telnet_rx_tail != telnet_rx_head && read < max_len) {
+        data[read++] = telnet_rx_ring[telnet_rx_tail];
+        telnet_rx_tail = telnet_rx_next(telnet_rx_tail);
+    }
+    restore_interrupts(flags);
+    return read;
 }
 
 static const char *wifi_status_name(int status) {
@@ -216,14 +280,59 @@ static void wifi_poll_connect(void) {
     }
 }
 
-static void telnet_reset(void) {
+static void telnet_free_protocol(void) {
     if (telnet) {
         telnet_free(telnet);
         telnet = NULL;
     }
+}
+
+static void telnet_reset_protocol(void) {
+    telnet_free_protocol();
+    telnet_rx_clear();
+}
+
+static void telnet_reset(void) {
+    telnet_reset_protocol();
     telnet_state = TELNET_IDLE;
     telnet_port = TELNET_DEFAULT_PORT;
     telnet_host[0] = '\0';
+    telnet_start_pending = false;
+    telnet_reset_pending = false;
+}
+
+static void telnet_defer_reset(void) {
+    uint32_t flags = save_and_disable_interrupts();
+    telnet_state = TELNET_IDLE;
+    telnet_start_pending = false;
+    telnet_reset_pending = true;
+    restore_interrupts(flags);
+    telnet_rx_clear();
+}
+
+static void telnet_defer_start(void) {
+    uint32_t flags = save_and_disable_interrupts();
+    telnet_start_pending = true;
+    telnet_reset_pending = false;
+    restore_interrupts(flags);
+}
+
+static bool telnet_take_reset_pending(void) {
+    bool pending;
+    uint32_t flags = save_and_disable_interrupts();
+    pending = telnet_reset_pending;
+    telnet_reset_pending = false;
+    restore_interrupts(flags);
+    return pending;
+}
+
+static bool telnet_take_start_pending(void) {
+    bool pending;
+    uint32_t flags = save_and_disable_interrupts();
+    pending = telnet_start_pending;
+    telnet_start_pending = false;
+    restore_interrupts(flags);
+    return pending;
 }
 
 static void telnet_send_window_size(void) {
@@ -289,7 +398,7 @@ static void telnet_event_handler(telnet_t *session, telnet_event_t *event, void 
 }
 
 static bool telnet_start_protocol(void) {
-    telnet_reset();
+    telnet_free_protocol();
     telnet = telnet_init(telnet_options, telnet_event_handler, 0, NULL);
     if (!telnet) {
         output_enqueue("telnet: protocol init failed\r\n", 30);
@@ -325,14 +434,25 @@ static err_t telnet_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_
     if (!p) {
         telnet_pcb = NULL;
         bool aborted = telnet_close_pcb_lwip(pcb);
-        telnet_reset();
+        telnet_defer_reset();
         output_enqueue("\r\n[telnet closed]\r\n", 19);
         return aborted ? ERR_ABRT : ERR_OK;
     }
 
+    if (telnet_state != TELNET_CONNECTED) {
+        tcp_recved(pcb, p->tot_len);
+        pbuf_free(p);
+        return ERR_OK;
+    }
+
+    if (telnet_rx_free_space() < p->tot_len) {
+        return ERR_MEM;
+    }
+
     for (struct pbuf *q = p; q; q = q->next) {
-        if (telnet) {
-            telnet_recv(telnet, (const char *)q->payload, q->len);
+        size_t written = telnet_rx_enqueue((const char *)q->payload, q->len);
+        if (written != q->len) {
+            return ERR_MEM;
         }
     }
     tcp_recved(pcb, p->tot_len);
@@ -343,7 +463,7 @@ static err_t telnet_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_
 static void telnet_error(void *arg, err_t err) {
     (void)arg;
     telnet_pcb = NULL;
-    telnet_reset();
+    telnet_defer_reset();
     output_printf("\r\n[telnet error %d]\r\n", (int)err);
 }
 
@@ -351,18 +471,14 @@ static err_t telnet_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
     (void)arg;
     if (err != ERR_OK) {
         telnet_pcb = NULL;
-        telnet_reset();
+        telnet_defer_reset();
         output_printf("\r\n[telnet connect failed: %d]\r\n", (int)err);
         return err;
     }
 
     telnet_pcb = pcb;
-    if (!telnet_start_protocol()) {
-        telnet_pcb = NULL;
-        bool aborted = telnet_close_pcb_lwip(pcb);
-        return aborted ? ERR_ABRT : ERR_MEM;
-    }
     telnet_state = TELNET_CONNECTED;
+    telnet_defer_start();
     output_enqueue("\r\n[telnet connected; ctrl-] closes]\r\n", 36);
     return ERR_OK;
 }
@@ -410,6 +526,53 @@ static void telnet_dns_found(const char *name, const ip_addr_t *addr, void *arg)
     (void)telnet_connect_addr_lwip(addr);
 }
 
+static void telnet_process_start(void) {
+    if (!telnet_take_start_pending()) {
+        return;
+    }
+
+    cyw43_arch_lwip_begin();
+    bool started = telnet_pcb && telnet_state == TELNET_CONNECTED && telnet_start_protocol();
+    if (!started) {
+        struct tcp_pcb *pcb = telnet_pcb;
+        telnet_pcb = NULL;
+        (void)telnet_close_pcb_lwip(pcb);
+    }
+    cyw43_arch_lwip_end();
+
+    if (!started) {
+        telnet_reset();
+    }
+}
+
+static void telnet_process_rx(void) {
+    if (!telnet || !telnet_pcb || telnet_state != TELNET_CONNECTED) {
+        return;
+    }
+
+    char buffer[TELNET_WORK_CHUNK];
+    while (telnet && telnet_pcb && telnet_state == TELNET_CONNECTED) {
+        size_t len = telnet_rx_dequeue(buffer, sizeof(buffer));
+        if (!len) {
+            break;
+        }
+
+        cyw43_arch_lwip_begin();
+        if (telnet && telnet_pcb && telnet_state == TELNET_CONNECTED) {
+            telnet_recv(telnet, buffer, len);
+        }
+        cyw43_arch_lwip_end();
+    }
+}
+
+static void telnet_task(void) {
+    if (telnet_take_reset_pending()) {
+        telnet_reset();
+    }
+    telnet_process_start();
+    telnet_process_rx();
+}
+
 void typewriter_net_init(typewriter_net_writer_t writer) {
     output_writer = writer;
     if (wifi_ready) {
@@ -435,6 +598,7 @@ void typewriter_net_task(void) {
     }
 
     wifi_poll_connect();
+    telnet_task();
     output_drain();
 }
 
@@ -531,6 +695,9 @@ bool typewriter_net_telnet_open(const char *host, uint16_t port) {
     strncpy(telnet_host, host, sizeof(telnet_host) - 1u);
     telnet_host[sizeof(telnet_host) - 1u] = '\0';
     telnet_port = port ? port : TELNET_DEFAULT_PORT;
+    telnet_rx_clear();
+    telnet_start_pending = false;
+    telnet_reset_pending = false;
     telnet_state = TELNET_RESOLVING;
     uint32_t generation = ++telnet_generation;
 
