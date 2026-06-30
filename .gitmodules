@@ -1,0 +1,15 @@
+[submodule "examples/pico_tv_typewriter/lib/tinyusb"]
+	path = examples/pico_tv_typewriter/lib/tinyusb
+	url = https://github.com/ianhan/tinyusb-EPx
+	branch = rp2040-epx-only
+[submodule "examples/pico_tv_typewriter/lib/flanterm"]
+	path = examples/pico_tv_typewriter/lib/flanterm
+	url = https://github.com/Mintsuki/Flanterm.git
+	branch = trunk
+[submodule "examples/pico_gc_mystify/lib/tinyusb"]
+	path = examples/pico_gc_mystify/lib/tinyusb
+	url = https://github.com/ianhan/tinyusb-EPx
+	branch = rp2040-epx-only
+[submodule "examples/pico_gc_mystify/lib/gc"]
+	path = examples/pico_gc_mystify/lib/gc
+	url = https://www.github.com/ianhan/gc

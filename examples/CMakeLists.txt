@@ -1,0 +1,2 @@
+add_subdirectory(pico_tv_typewriter)
+add_subdirectory(pico_gc_mystify)
