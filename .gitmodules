@@ -13,3 +13,6 @@
 [submodule "examples/pico_gc_mystify/lib/gc"]
 	path = examples/pico_gc_mystify/lib/gc
 	url = https://www.github.com/ianhan/gc
+[submodule "examples/pico_tv_typewriter/lib/libtelnet"]
+	path = examples/pico_tv_typewriter/lib/libtelnet
+	url = https://github.com/seanmiddleditch/libtelnet.git

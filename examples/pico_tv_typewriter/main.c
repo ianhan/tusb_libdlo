@@ -530,7 +530,7 @@ static void handle_displaylink_mount(uint8_t dev_addr) {
         .max_rows = TYPEWRITER_ROWS,
         .margin_x = 0,
         .margin_y = 0,
-        .default_fg_rgb = 0x00d7ffd7u,
+        .default_fg_rgb = 0x00ffffffu,
         .default_bg_rgb = 0x00000000u,
     };
 

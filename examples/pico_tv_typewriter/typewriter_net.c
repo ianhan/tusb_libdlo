@@ -23,16 +23,14 @@
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
+#include "libtelnet.h"
 
 #define NET_OUTPUT_SIZE 16384u
 #define WIFI_CONNECT_TIMEOUT_MS 30000u
 #define TELNET_DEFAULT_PORT 23u
-
-#define TELNET_IAC 255u
-#define TELNET_DONT 254u
-#define TELNET_DO 253u
-#define TELNET_WONT 252u
-#define TELNET_WILL 251u
+#define TELNET_TERMINAL_TYPE "xterm-256color"
+#define TELNET_WINDOW_COLS 80u
+#define TELNET_WINDOW_ROWS 30u
 
 typedef enum telnet_state_e {
     TELNET_IDLE,
@@ -40,12 +38,6 @@ typedef enum telnet_state_e {
     TELNET_CONNECTING,
     TELNET_CONNECTED,
 } telnet_state_t;
-
-typedef enum telnet_iac_state_e {
-    TELNET_IAC_DATA,
-    TELNET_IAC_COMMAND,
-    TELNET_IAC_OPTION,
-} telnet_iac_state_t;
 
 static typewriter_net_writer_t output_writer;
 static char output_ring[NET_OUTPUT_SIZE];
@@ -59,12 +51,19 @@ static int wifi_last_status = INT_MIN;
 static absolute_time_t wifi_connect_deadline;
 
 static telnet_state_t telnet_state = TELNET_IDLE;
-static telnet_iac_state_t telnet_iac_state = TELNET_IAC_DATA;
-static uint8_t telnet_iac_command;
+static telnet_t *telnet;
 static struct tcp_pcb *telnet_pcb;
 static uint16_t telnet_port = TELNET_DEFAULT_PORT;
 static uint32_t telnet_generation;
 static char telnet_host[96];
+
+static const telnet_telopt_t telnet_options[] = {
+    { TELNET_TELOPT_TTYPE, TELNET_WILL, TELNET_DONT },
+    { TELNET_TELOPT_NAWS, TELNET_WILL, TELNET_DONT },
+    { TELNET_TELOPT_ECHO, TELNET_WONT, TELNET_DO },
+    { TELNET_TELOPT_SGA, TELNET_WONT, TELNET_DO },
+    { -1, 0, 0 },
+};
 
 static uint16_t ring_next(uint16_t value) {
     return (uint16_t)((value + 1u) % NET_OUTPUT_SIZE);
@@ -218,57 +217,88 @@ static void wifi_poll_connect(void) {
 }
 
 static void telnet_reset(void) {
+    if (telnet) {
+        telnet_free(telnet);
+        telnet = NULL;
+    }
     telnet_state = TELNET_IDLE;
-    telnet_iac_state = TELNET_IAC_DATA;
-    telnet_iac_command = 0;
     telnet_port = TELNET_DEFAULT_PORT;
     telnet_host[0] = '\0';
 }
 
-static void telnet_reply_option(uint8_t command, uint8_t option) {
-    if (!telnet_pcb) {
+static void telnet_send_window_size(void) {
+    if (!telnet) {
         return;
     }
-    uint8_t reply[3] = {TELNET_IAC, command, option};
-    if (tcp_write(telnet_pcb, reply, sizeof(reply), TCP_WRITE_FLAG_COPY) == ERR_OK) {
-        (void)tcp_output(telnet_pcb);
+
+    const char size[] = {
+        (uint8_t)(TELNET_WINDOW_COLS >> 8u),
+        (uint8_t)TELNET_WINDOW_COLS,
+        (uint8_t)(TELNET_WINDOW_ROWS >> 8u),
+        (uint8_t)TELNET_WINDOW_ROWS,
+    };
+
+    telnet_begin_sb(telnet, TELNET_TELOPT_NAWS);
+    telnet_send(telnet, size, sizeof(size));
+    telnet_finish_sb(telnet);
+}
+
+static void telnet_write_network(const char *data, size_t len) {
+    if (!telnet_pcb || !data || !len) {
+        return;
+    }
+
+    err_t err = tcp_write(telnet_pcb, data, len, TCP_WRITE_FLAG_COPY);
+    if (err == ERR_OK) {
+        err = tcp_output(telnet_pcb);
+    }
+    if (err != ERR_OK) {
+        output_printf("\r\ntelnet: write failed: %d\r\n", (int)err);
     }
 }
 
-static void telnet_process_payload(const uint8_t *data, size_t len) {
-    for (size_t i = 0; i < len; ++i) {
-        uint8_t byte = data[i];
-        switch (telnet_iac_state) {
-        case TELNET_IAC_DATA:
-            if (byte == TELNET_IAC) {
-                telnet_iac_state = TELNET_IAC_COMMAND;
-            } else {
-                char c = (char)byte;
-                output_enqueue(&c, 1);
-            }
-            break;
-        case TELNET_IAC_COMMAND:
-            if (byte == TELNET_IAC) {
-                char c = (char)TELNET_IAC;
-                output_enqueue(&c, 1);
-                telnet_iac_state = TELNET_IAC_DATA;
-            } else if (byte == TELNET_DO || byte == TELNET_DONT || byte == TELNET_WILL || byte == TELNET_WONT) {
-                telnet_iac_command = byte;
-                telnet_iac_state = TELNET_IAC_OPTION;
-            } else {
-                telnet_iac_state = TELNET_IAC_DATA;
-            }
-            break;
-        case TELNET_IAC_OPTION:
-            if (telnet_iac_command == TELNET_DO) {
-                telnet_reply_option(TELNET_WONT, byte);
-            } else if (telnet_iac_command == TELNET_WILL) {
-                telnet_reply_option(TELNET_DONT, byte);
-            }
-            telnet_iac_state = TELNET_IAC_DATA;
-            break;
+static void telnet_event_handler(telnet_t *session, telnet_event_t *event, void *user_data) {
+    (void)user_data;
+
+    switch (event->type) {
+    case TELNET_EV_DATA:
+        output_enqueue(event->data.buffer, event->data.size);
+        break;
+    case TELNET_EV_SEND:
+        telnet_write_network(event->data.buffer, event->data.size);
+        break;
+    case TELNET_EV_TTYPE:
+        if (event->ttype.cmd == TELNET_TTYPE_SEND) {
+            telnet_ttype_is(session, TELNET_TERMINAL_TYPE);
         }
+        break;
+    case TELNET_EV_DO:
+        if (event->neg.telopt == TELNET_TELOPT_NAWS) {
+            telnet_send_window_size();
+        }
+        break;
+    case TELNET_EV_WARNING:
+        output_printf("\r\ntelnet: warning: %s\r\n", event->error.msg);
+        break;
+    case TELNET_EV_ERROR:
+        output_printf("\r\ntelnet: error: %s\r\n", event->error.msg);
+        break;
+    default:
+        break;
     }
+}
+
+static bool telnet_start_protocol(void) {
+    telnet_reset();
+    telnet = telnet_init(telnet_options, telnet_event_handler, 0, NULL);
+    if (!telnet) {
+        output_enqueue("telnet: protocol init failed\r\n", 30);
+        return false;
+    }
+
+    telnet_negotiate(telnet, TELNET_WILL, TELNET_TELOPT_TTYPE);
+    telnet_negotiate(telnet, TELNET_WILL, TELNET_TELOPT_NAWS);
+    return true;
 }
 
 static bool telnet_close_pcb_lwip(struct tcp_pcb *pcb) {
@@ -286,7 +316,7 @@ static bool telnet_close_pcb_lwip(struct tcp_pcb *pcb) {
     return false;
 }
 
-static err_t telnet_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
+static err_t telnet_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     (void)arg;
     if (err != ERR_OK) {
         return err;
@@ -301,7 +331,9 @@ static err_t telnet_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t e
     }
 
     for (struct pbuf *q = p; q; q = q->next) {
-        telnet_process_payload((const uint8_t *)q->payload, q->len);
+        if (telnet) {
+            telnet_recv(telnet, (const char *)q->payload, q->len);
+        }
     }
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
@@ -325,6 +357,11 @@ static err_t telnet_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
     }
 
     telnet_pcb = pcb;
+    if (!telnet_start_protocol()) {
+        telnet_pcb = NULL;
+        bool aborted = telnet_close_pcb_lwip(pcb);
+        return aborted ? ERR_ABRT : ERR_MEM;
+    }
     telnet_state = TELNET_CONNECTED;
     output_enqueue("\r\n[telnet connected; ctrl-] closes]\r\n", 36);
     return ERR_OK;
@@ -344,7 +381,7 @@ static bool telnet_connect_addr_lwip(const ip_addr_t *addr) {
     telnet_pcb = pcb;
     telnet_state = TELNET_CONNECTING;
     tcp_arg(pcb, NULL);
-    tcp_recv(pcb, telnet_recv);
+    tcp_recv(pcb, telnet_recv_cb);
     tcp_err(pcb, telnet_error);
 
     err_t err = tcp_connect(pcb, addr, telnet_port, telnet_connected);
@@ -495,7 +532,6 @@ bool typewriter_net_telnet_open(const char *host, uint16_t port) {
     telnet_host[sizeof(telnet_host) - 1u] = '\0';
     telnet_port = port ? port : TELNET_DEFAULT_PORT;
     telnet_state = TELNET_RESOLVING;
-    telnet_iac_state = TELNET_IAC_DATA;
     uint32_t generation = ++telnet_generation;
 
     ip_addr_t addr;
@@ -526,7 +562,7 @@ bool typewriter_net_telnet_open(const char *host, uint16_t port) {
 }
 
 void typewriter_net_telnet_send(const char *data, size_t len) {
-    if (!telnet_pcb || telnet_state != TELNET_CONNECTED || !data || !len) {
+    if (!telnet || !telnet_pcb || telnet_state != TELNET_CONNECTED || !data || !len) {
         return;
     }
 
@@ -553,15 +589,8 @@ void typewriter_net_telnet_send(const char *data, size_t len) {
     }
 
     cyw43_arch_lwip_begin();
-    err_t err = tcp_write(telnet_pcb, buffer, used, TCP_WRITE_FLAG_COPY);
-    if (err == ERR_OK) {
-        err = tcp_output(telnet_pcb);
-    }
+    telnet_send(telnet, buffer, used);
     cyw43_arch_lwip_end();
-
-    if (err != ERR_OK) {
-        output_printf("\r\ntelnet: write failed: %d\r\n", (int)err);
-    }
 }
 
 void typewriter_net_telnet_close(void) {

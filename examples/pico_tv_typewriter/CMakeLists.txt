@@ -63,6 +63,7 @@ target_include_directories(pico_tv_typewriter PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"
     "${PICO_TV_TYPEWRITER_GENERATED_DIR}"
     "${CMAKE_CURRENT_LIST_DIR}/lib/flanterm/src"
+    "${CMAKE_CURRENT_LIST_DIR}/lib/libtelnet"
 )
 
 set(PICO_TV_TYPEWRITER_WIFI 0)
@@ -86,6 +87,10 @@ target_link_libraries(pico_tv_typewriter PRIVATE
 )
 
 if(PICO_TV_TYPEWRITER_WIFI)
+    target_sources(pico_tv_typewriter PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/lib/libtelnet/libtelnet.c"
+    )
+
     target_link_libraries(pico_tv_typewriter PRIVATE
         pico_cyw43_arch_lwip_threadsafe_background
     )
