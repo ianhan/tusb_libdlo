@@ -51,6 +51,15 @@
 #define DLO_ENABLE_HOST_UPLOAD_RLE 1
 #endif
 
+/** Enable the "af 6b" mixed raw/run-length encoding for 16 bpp stripe uploads.
+ *  It interleaves raw spans and repeat counts within one command, so mixed
+ *  content (text: background runs plus glyph detail) encodes far better than
+ *  the all-or-nothing raw/RLE choice. Requires DLO_ENABLE_HOST_UPLOAD_RLE.
+ */
+#ifndef DLO_ENABLE_HOST_UPLOAD_RLX
+#define DLO_ENABLE_HOST_UPLOAD_RLX 1
+#endif
+
 
 /* File-scope inline functions ---------------------------------------------------------*/
 
@@ -327,7 +336,12 @@ static dlo_retcode_t cmd_rle8(dlo_device_t * const dev,
                               const dlo_col8_t * const pixels,
                               const uint32_t width,
                               const size_t runs);
-static size_t count_runs16(const dlo_col16_t * const pixels, const uint32_t width);
+static dlo_retcode_t cmd_rlx16(dlo_device_t * const dev,
+                               dlo_ptr_t base,
+                               const dlo_col16_t * const pixels,
+                               const uint32_t width,
+                               const size_t size);
+static size_t measure_stripe16(const dlo_col16_t * const pixels, const uint32_t width, size_t * const rlx_bytes);
 static size_t count_runs8(const dlo_col8_t * const pixels, const uint32_t width);
 
 
@@ -420,8 +434,11 @@ dlo_retcode_t dlo_grfx_init(const dlo_init_t flags)
 
   stripe16 = malloc(SCRAPE_MAX_PIXELS * sizeof(dlo_col16_t));
   NERR(stripe16);
-  stripe8  = malloc(SCRAPE_MAX_PIXELS * sizeof(dlo_col8_t));
-  NERR(stripe8);
+  if (!DLO_16BPP_SCANOUT)
+  {
+    stripe8 = malloc(SCRAPE_MAX_PIXELS * sizeof(dlo_col8_t));
+    NERR(stripe8);
+  }
 
   /* Initialise the default look-up table for 8 bpp in bgr323 format */
   for (red = 0; red < 8; red++)
@@ -471,8 +488,8 @@ dlo_retcode_t dlo_grfx_fill_rect(dlo_device_t * const dev, const dlo_area_t * co
   ASSERT(dev && area)
   ASSERT(area->view.width && area->view.height);
 
-  /* Only 24 bpp is supported */
-  if (area->view.bpp != 24)
+  /* Only the scanout colour depth of this build is supported */
+  if (area->view.bpp != DLO_VIEW_BPP)
     return dlo_err_bad_col;
 
   /* Compute some useful values */
@@ -501,8 +518,8 @@ dlo_retcode_t dlo_grfx_copy_rect(dlo_device_t * const dev, const dlo_area_t * co
   ASSERT(src_area->view.width == dest_area->view.width && src_area->view.height == dest_area->view.height);
   ASSERT(src_area->view.bpp == dest_area->view.bpp);
 
-  /* Only 24 bpp is supported */
-  if (src_area->view.bpp != 24)
+  /* Only the scanout colour depth of this build is supported */
+  if (src_area->view.bpp != DLO_VIEW_BPP)
     return dlo_err_bad_col;
 
   /* Quick exit if we're copying to and from the same location */
@@ -567,8 +584,8 @@ dlo_retcode_t dlo_grfx_copy_host_bmp(dlo_device_t * const dev, const dlo_bmpflag
   ASSERT(fbuf->width && fbuf->height && fbuf->base && fbuf->stride);
   ASSERT(fbuf->width == area->view.width && fbuf->height == area->view.height)
 
-  /* Only 24 bpp is supported */
-  if (area->view.bpp != 24)
+  /* Only the scanout colour depth of this build is supported */
+  if (area->view.bpp != DLO_VIEW_BPP)
     return dlo_err_bad_col;
 
   /* Get a pixel reading function pointer for the fbuf */
@@ -657,7 +674,8 @@ static dlo_retcode_t hline_24bpp(dlo_device_t * const dev, dlo_ptr_t base16, dlo
   if (len < 256)
   {
     ERR(cmd_hline16(dev, base16, len, col16));
-    ERR(cmd_hline8( dev, base8,  len, col8));
+    if (!DLO_16BPP_SCANOUT)
+      ERR(cmd_hline8(dev, base8, len, col8));
   }
   else
   {
@@ -668,13 +686,15 @@ static dlo_retcode_t hline_24bpp(dlo_device_t * const dev, dlo_ptr_t base16, dlo
     for (; base16 < roff16; base16 += BYTES_PER_16BPP * 256)
     {
       ERR(cmd_hline16(dev, base16, 0, col16));
-      ERR(cmd_hline8( dev, base8,  0, col8));
+      if (!DLO_16BPP_SCANOUT)
+        ERR(cmd_hline8(dev, base8, 0, col8));
       base8 += BYTES_PER_8BPP * 256;
     }
     if (rem)
     {
       ERR(cmd_hline16(dev, roff16, rem, col16));
-      ERR(cmd_hline8( dev, roff8,  rem, col8));
+      if (!DLO_16BPP_SCANOUT)
+        ERR(cmd_hline8(dev, roff8, rem, col8));
     }
   }
   return dlo_ok;
@@ -693,7 +713,8 @@ static dlo_retcode_t copy_24bpp(dlo_device_t * const dev, dlo_ptr_t src_base16, 
   if (len < 256)
   {
     ERR(cmd_copy16(dev, src_base16, len, dest_base16));
-    ERR(cmd_copy8( dev, src_base8,  len, dest_base8));
+    if (!DLO_16BPP_SCANOUT)
+      ERR(cmd_copy8(dev, src_base8, len, dest_base8));
   }
   else
   {
@@ -706,7 +727,8 @@ static dlo_retcode_t copy_24bpp(dlo_device_t * const dev, dlo_ptr_t src_base16, 
     for (; src_base16 < src_roff16; src_base16 += BYTES_PER_16BPP * 256)
     {
       ERR(cmd_copy16(dev, src_base16, 0, dest_base16));
-      ERR(cmd_copy8( dev, src_base8,  0, dest_base8));
+      if (!DLO_16BPP_SCANOUT)
+        ERR(cmd_copy8(dev, src_base8, 0, dest_base8));
       dest_base16 += BYTES_PER_16BPP * 256;
       src_base8   += BYTES_PER_8BPP  * 256;
       dest_base8  += BYTES_PER_8BPP  * 256;
@@ -714,7 +736,8 @@ static dlo_retcode_t copy_24bpp(dlo_device_t * const dev, dlo_ptr_t src_base16, 
     if (rem)
     {
       ERR(cmd_copy16(dev, src_roff16, rem, dest_roff16));
-      ERR(cmd_copy8( dev, src_roff8,  rem, dest_roff8));
+      if (!DLO_16BPP_SCANOUT)
+        ERR(cmd_copy8(dev, src_roff8, rem, dest_roff8));
     }
   }
   return dlo_ok;
@@ -740,7 +763,8 @@ static dlo_retcode_t scrape_24bpp(dlo_device_t * const dev, const read_pixel_t r
       dlo_col32_t col = rdpx(src_base, swap);
 
       *ptr_col16++ = rgb16(col);
-      *ptr_col8++  = rgb8(col);
+      if (!DLO_16BPP_SCANOUT)
+        *ptr_col8++ = rgb8(col);
     }
   }
   return cmd_stripe24(dev, dest_base16, dest_base8, width);
@@ -792,7 +816,8 @@ static dlo_retcode_t cmd_stripe24_rgbx8888(dlo_device_t * const dev, const uint8
       dlo_col32_t col = RD_L(src);
 
       stripe16[pix] = rgbx8888_to_rgb565(col);
-      stripe8[pix] = rgbx8888_to_rgb323(col);
+      if (!DLO_16BPP_SCANOUT)
+        stripe8[pix] = rgbx8888_to_rgb323(col);
       src += sizeof(uint32_t);
     }
 
@@ -813,25 +838,33 @@ static dlo_retcode_t cmd_stripe24_chunk(dlo_device_t * const dev,
                                          const uint32_t width)
 {
 #if DLO_ENABLE_HOST_UPLOAD_RLE
-  size_t runs16 = count_runs16(pixels16, width);
-  size_t runs8  = count_runs8(pixels8, width);
+  size_t rlx16  = 0;
+  size_t runs16 = measure_stripe16(pixels16, width, &rlx16);
   size_t raw16  = DSIZEOF(WRITE_RAW16) + 4u + (BYTES_PER_16BPP * width);
-  size_t raw8   = DSIZEOF(WRITE_RAW8) + 4u + (BYTES_PER_8BPP * width);
   size_t rle16  = DSIZEOF(WRITE_RL16) + 4u + (3u * runs16);
-  size_t rle8   = DSIZEOF(WRITE_RL8) + 4u + (2u * runs8);
 
-  if (rle16 <= raw16)
+  if (DLO_ENABLE_HOST_UPLOAD_RLX && rlx16 <= raw16 && rlx16 <= rle16)
+    ERR(cmd_rlx16(dev, base16, pixels16, width, rlx16));
+  else if (rle16 <= raw16)
     ERR(cmd_rle16(dev, base16, pixels16, width, runs16));
   else
     ERR(cmd_raw16(dev, base16, pixels16, width));
 
-  if (rle8 <= raw8)
-    ERR(cmd_rle8(dev, base8, pixels8, width, runs8));
-  else
-    ERR(cmd_raw8(dev, base8, pixels8, width));
+  if (!DLO_16BPP_SCANOUT)
+  {
+    size_t runs8 = count_runs8(pixels8, width);
+    size_t raw8  = DSIZEOF(WRITE_RAW8) + 4u + (BYTES_PER_8BPP * width);
+    size_t rle8  = DSIZEOF(WRITE_RL8) + 4u + (2u * runs8);
+
+    if (rle8 <= raw8)
+      ERR(cmd_rle8(dev, base8, pixels8, width, runs8));
+    else
+      ERR(cmd_raw8(dev, base8, pixels8, width));
+  }
 #else
   ERR(cmd_raw16(dev, base16, pixels16, width));
-  ERR(cmd_raw8(dev, base8, pixels8, width));
+  if (!DLO_16BPP_SCANOUT)
+    ERR(cmd_raw8(dev, base8, pixels8, width));
 #endif
 
   return dlo_ok;
@@ -971,9 +1004,105 @@ static dlo_retcode_t cmd_rle8(dlo_device_t * const dev,
 }
 
 
-static size_t count_runs16(const dlo_col16_t * const pixels, const uint32_t width)
+/** Build an "af 6b" mixed raw/run-length command in a buffer.
+ *
+ *  The command decodes @a width pixels as alternating spans:
+ *
+ *    af 6b addr24 total { raw_count raw_pixels... [repeat_count] }...
+ *
+ *  Each span is a count byte followed by that many raw 16 bpp big-endian
+ *  pixels; when a raw span is followed by a repeat count byte, the last raw
+ *  pixel is repeated that many additional times. A count of zero means 256.
+ *  This matches the encoding emitted by the Linux udlfb driver.
+ *
+ *  @param  dev     Pointer to @a dlo_device_t structure.
+ *  @param  base    Destination address in device for start of pixels.
+ *  @param  pixels  Base address of the pixels to write.
+ *  @param  width   Number of pixels to write (1..256).
+ *  @param  size    Encoded command size from @c measure_stripe16() (bytes).
+ *
+ *  @return  Return code, zero for no error.
+ */
+static dlo_retcode_t cmd_rlx16(dlo_device_t * const dev,
+                               dlo_ptr_t base,
+                               const dlo_col16_t * const pixels,
+                               const uint32_t width,
+                               const size_t size)
+{
+  uint32_t pos = 0;
+  uint32_t raw_start = 0;
+  char *raw_count_byte;
+#ifdef DEBUG
+  char *cmd_start;
+#endif
+
+  if ((size_t)(dev->bufend - dev->bufptr) < size + BUF_HIGH_WATER_MARK)
+    ERR(dlo_usb_write(dev));
+  if ((size_t)(dev->bufend - dev->bufptr) < size)
+    return dlo_err_buf_full;
+
+#ifdef DEBUG
+  cmd_start = dev->bufptr;
+#endif
+  *(dev->bufptr)++ = WRITE_RLX16[0];
+  *(dev->bufptr)++ = WRITE_RLX16[1];
+  *(dev->bufptr)++ = (char)(base >> 16);
+  *(dev->bufptr)++ = (char)(base >> 8);
+  *(dev->bufptr)++ = (char)(base & 0xFF);
+  *(dev->bufptr)++ = (char)command_count(width);
+
+  raw_count_byte = dev->bufptr++;
+  while (pos < width)
+  {
+    dlo_col16_t col = pixels[pos];
+
+    *(dev->bufptr)++ = (char)(col >> 8);
+    *(dev->bufptr)++ = (char)(col & 0xFF);
+    pos++;
+
+    if (pos < width && pixels[pos] == col)
+    {
+      /* Close the raw span (it includes the first copy of the repeating pixel),
+       * consume the run and emit the additional repeat count, then reserve the
+       * count byte for the next raw span.
+       */
+      uint32_t repeat_start = pos;
+
+      *raw_count_byte = (char)((pos - raw_start) & 0xFFu);
+      do
+        pos++;
+      while (pos < width && pixels[pos] == col);
+      *(dev->bufptr)++ = (char)((pos - repeat_start) & 0xFFu);
+
+      raw_start = pos;
+      raw_count_byte = dev->bufptr++;
+    }
+  }
+
+  if (pos > raw_start)
+    *raw_count_byte = (char)((pos - raw_start) & 0xFFu);
+  else
+    dev->bufptr--;  /* the command ended on a repeat: undo the reserved count byte */
+
+  ASSERT((size_t)(dev->bufptr - cmd_start) == size);
+  return dlo_ok;
+}
+
+
+/** Measure a 16 bpp stripe in one pass: count the pixel runs (for the RLE cost)
+ *  and compute the exact "af 6b" command size that @c cmd_rlx16() would emit.
+ *
+ *  @param  pixels     Base address of the pixels to measure.
+ *  @param  width      Number of pixels (1..256).
+ *  @param  rlx_bytes  Returns the exact @c cmd_rlx16() command size (bytes).
+ *
+ *  @return  Number of pixel runs (for the RLE size computation).
+ */
+static size_t measure_stripe16(const dlo_col16_t * const pixels, const uint32_t width, size_t * const rlx_bytes)
 {
   size_t runs = 0;
+  size_t rlx = 7;  /* header, total count and the first raw span count byte */
+  bool last_run_repeated = false;
   uint32_t pos = 0;
 
   while (pos < width)
@@ -981,9 +1110,21 @@ static size_t count_runs16(const dlo_col16_t * const pixels, const uint32_t widt
     dlo_col16_t col = pixels[pos++];
 
     runs++;
-    while (pos < width && pixels[pos] == col)
-      pos++;
+    rlx += 2;
+    last_run_repeated = false;
+    if (pos < width && pixels[pos] == col)
+    {
+      do
+        pos++;
+      while (pos < width && pixels[pos] == col);
+      rlx += 2;  /* repeat count byte plus the next raw span count byte */
+      last_run_repeated = true;
+    }
   }
+  if (last_run_repeated)
+    rlx--;  /* the trailing raw span never materialised */
+
+  *rlx_bytes = rlx;
   return runs;
 }
 

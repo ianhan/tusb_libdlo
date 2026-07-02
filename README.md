@@ -25,10 +25,12 @@ I included some examples, because - why not. The repository includes two Pico 1 
 
 `pico_tv_typewriter` is a dumb tv typewriter, but the pico W build supports telnet over WIFI (that's the aquarium demonstration on telehack in the gif).
 
+The example dependencies are marked `update = none` in `.gitmodules`, so projects embedding this repository as a submodule never pull them, even with `--recursive`. To build the examples, opt in explicitly with `--checkout`:
+
 ### Root Build
 
 ```sh
-git submodule update --init --recursive
+git submodule update --init --checkout --recursive
 cmake -S . -B build -DPICO_BOARD=pico
 cmake --build build --target pico_tv_typewriter
 cmake --build build --target pico_gc_mystify

@@ -704,7 +704,7 @@ dlo_retcode_t dlo_fill_rect_unclipped(const dlo_dev_t uid,
       height > (uint32_t)view->height - (uint32_t)y)
     return dlo_err_bad_view;
 
-  if (view->bpp != 24)
+  if (view->bpp != DLO_VIEW_BPP)
     return dlo_err_bad_col;
 
   pix_off = (uint32_t)x + ((uint32_t)y * view->width);
@@ -806,7 +806,7 @@ dlo_retcode_t dlo_copy_rect_unclipped(const dlo_dev_t uid,
       src_view->bpp != dest_view->bpp)
     return dlo_err_bad_view;
 
-  if (src_view->bpp != 24)
+  if (src_view->bpp != DLO_VIEW_BPP)
     return dlo_err_bad_col;
 
   if (src_x < 0 || src_y < 0 || dest_x < 0 || dest_y < 0 ||
@@ -911,7 +911,7 @@ dlo_retcode_t dlo_copy_rgbx8888_line(const dlo_dev_t uid,
       width > (uint32_t)view->width - (uint32_t)x)
     return dlo_err_bad_view;
 
-  if (view->bpp != 24)
+  if (view->bpp != DLO_VIEW_BPP)
     return dlo_err_bad_col;
 
   pix_off = (uint32_t)x + ((uint32_t)y * view->width);
@@ -957,6 +957,11 @@ dlo_device_t *dlo_new_device(const dlo_devtype_t type, const char * const serial
 
   /* Device-dependent attributes */
   dev->buffer = NULL;
+  dev->bufptr = NULL;
+  dev->bufend = NULL;
+  dev->buffers[0] = NULL;
+  dev->buffers[1] = NULL;
+  dev->buf_index = 0;
 
   /* Connection-dependent attributes.
    *
