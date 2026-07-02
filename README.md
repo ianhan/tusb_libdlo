@@ -17,6 +17,14 @@ This is the libdlo DisplayLink library with some optimizations, ported to TinyUS
 
 `tusb_libdlo` links against the Pico SDK `tinyusb_host` target and enables the TinyUSB endpoint-transfer API required by the port.
 
+Build options:
+
+| option | default | effect |
+| - | - | - |
+| `TUSB_LIBDLO_COMMAND_BUFFER_SIZE` | `16384` | USB command buffer size in bytes. The buffer is split into two halves so encoding the next commands overlaps the in-flight bulk transfer. |
+| `TUSB_LIBDLO_16BPP_SCANOUT` | `OFF` | Run the device in 16bpp scanout mode and skip the 8bpp fine-detail plane: roughly 35-40% less USB traffic at RGB565 fidelity instead of the split-plane 24bpp mode. |
+| `TUSB_LIBDLO_RLX` | `ON` | Use the `af 6b` mixed raw/run-length encoding for pixel uploads; the smallest of raw, RLE, and mixed is chosen per 256-pixel chunk. |
+
 ## Examples
 
 I included some examples, because - why not. The repository includes two Pico 1 examples:
